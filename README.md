@@ -1,0 +1,1 @@
+# Esp32-para-detec-o-de-afastamento
