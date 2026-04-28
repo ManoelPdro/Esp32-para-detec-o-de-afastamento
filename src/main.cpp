@@ -7,7 +7,7 @@
 #include <Wire.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include "esp_bt.h"
+#include "BMI160Gen.h"
 
 // --- DEFINES ---
 #define DEVICE_NAME "ESP32 SENSOR"
@@ -23,16 +23,18 @@
 #define INTERVALO_TEMP 3000    
 #define INTERVALO_ACCEL 200    
 #define TEMPO_DURACAO_BUZZER 1500 
+#define COUNTDOWN_MOVIMENTO 5000 // Para verificar após 5 segundos se a criança parou de se mexer
 
 // CONFIGURAÇÃO DA HISTERESE (VARIAÇÃO MÍNIMA)
-#define TEMP_VARIACAO_LIMITE 0.5 // Só atualiza se mudar 0.5 graus ou mais
+#define TEMP_ESPERADA 33 // Espera que a temperatura da criança está por volta de 33 graus (ajuste esse valor e a variação limite caso necessário)
+#define TEMP_VARIACAO_LIMITE 2 // Caso a temperatura varie 2 graus ou mais pode ser que a criança tenha removido e o esp envia o sinal para o app
 
-// Endereços BMI160
-#define BMI160_ADDR 0x69 
-#define REG_ACCEL_DATA 0x12 
-#define REG_CMD        0x7E 
-#define CMD_ACCEL_NORMAL 0x11 
-#define CMD_SOFT_RESET   0xB6
+// Endereços e constantes BMI160
+#define BMI160_ADDR 0x69
+#define REG_CMD 0x7E
+#define CMD_GYR_SUSPEND 0x14
+#define LIMIAR 0.2
+#define GRAVIDADE 1.0
 
 // --- OBJETOS GLOBAIS ---
 BLECharacteristic *pCharacteristic_BUZZER;
@@ -44,8 +46,8 @@ OneWire oneWire(TEMP_PIN);
 DallasTemperature sensor_temp(&oneWire);
 
 // Variáveis de Dados
-int16_t accel_data[3]; 
-float temperatura_atual = -999.0; // Valor inicial impossível para forçar a 1ª atualização
+bool crianca_movimento = false; // Define se a criança está se mexendo
+bool pulseira_removida = false; // Indica se a criança ainda está com a pulseira
 
 // Flags de Estado
 bool accel_funcionando = false;
@@ -54,48 +56,24 @@ bool deviceConnected = false;
 // Timers
 unsigned long timer_accel = 0;
 unsigned long timer_temp = 0;
+unsigned long timer_ultimo_movimento = 0;
 
 // Variáveis para o Buzzer não-bloqueante
 unsigned long timer_inicio_buzzer = 0;
 bool buzzer_esta_tocando = false; 
 bool comando_buzzer_recebido = false; 
 
-// --- FUNÇÕES I2C BMI160 ---
-void writeRegister(uint8_t reg, uint8_t val) {
-  Wire.beginTransmission(BMI160_ADDR);
-  Wire.write(reg);
-  Wire.write(val);
-  Wire.endTransmission();
-}
-
-void readAccelRaw() {
-  Wire.beginTransmission(BMI160_ADDR);
-  Wire.write(REG_ACCEL_DATA);
-  Wire.endTransmission();
-  Wire.requestFrom(BMI160_ADDR, 6);
-  
-  if (Wire.available() == 6) {
-    uint8_t x_lsb = Wire.read(); uint8_t x_msb = Wire.read();
-    uint8_t y_lsb = Wire.read(); uint8_t y_msb = Wire.read();
-    uint8_t z_lsb = Wire.read(); uint8_t z_msb = Wire.read();
-    accel_data[0] = (x_msb << 8) | x_lsb;
-    accel_data[1] = (y_msb << 8) | y_lsb;
-    accel_data[2] = (z_msb << 8) | z_lsb;
-  }
-}
 
 // --- CALLBACKS BLE ---
 class MyServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *pServer) {
     deviceConnected = true;
     digitalWrite(LED_PIN, HIGH);
-    Serial.println("Dispositivo Conectado!");
   }
 
   void onDisconnect(BLEServer *pServer) {
     deviceConnected = false;
     digitalWrite(LED_PIN, LOW);
-    Serial.println("Dispositivo Desconectado.");
     pAdvertising->start(); 
   }
 };
@@ -105,49 +83,35 @@ class CharacteristicCallbacks : public BLECharacteristicCallbacks {
     std::string rxValue = std::string(pCharacteristic->getValue().c_str());
     if (rxValue.length() > 0 && rxValue.substr(0, 1) == "1") {
        comando_buzzer_recebido = true;
-       Serial.println("Comando Buzzer Recebido!");
     } 
   }
 };
 
-// --- FUNÇÃO DE BROADCAST ---
-void updateBroadcastData() {
-  if (deviceConnected) return; 
+// --- FUNÇÃO DO BMI160 ---
 
-  BLEAdvertisementData oAdvertisementData = BLEAdvertisementData();
-  oAdvertisementData.setFlags(0x04);
-  oAdvertisementData.setName(DEVICE_NAME);
+void readAccel(){
+  int axRaw, ayRaw, azRaw;
+  float accelX, accelY, accelZ;
+  float magnitude_accel;
 
-  uint8_t payload[10]; 
+  BMI160.readAccelerometer(axRaw, ayRaw, azRaw);
 
-  payload[0] = 0xFF; 
-  payload[1] = 0xFF;
+  accelX = axRaw/16384.0;
+  accelY = ayRaw/16384.0;
+  accelZ = azRaw/16384.0;
 
-  // Usa a temperatura_atual (que agora só muda se a variação for grande)
-  int16_t tempInt = (int16_t)(temperatura_atual * 100);
+  magnitude_accel = sqrt(sq(accelX) + sq(accelY) + sq(accelZ));
 
-  payload[2] = tempInt & 0xFF;
-  payload[3] = (tempInt >> 8) & 0xFF;
-
-  payload[4] = accel_data[0] & 0xFF;
-  payload[5] = (accel_data[0] >> 8) & 0xFF;
-
-  payload[6] = accel_data[1] & 0xFF;
-  payload[7] = (accel_data[1] >> 8) & 0xFF;
-
-  payload[8] = accel_data[2] & 0xFF;
-  payload[9] = (accel_data[2] >> 8) & 0xFF;
-
-  String strData = "";
-  for (int i = 0; i < 10; i++) {
-    strData += (char)payload[i];
+  if(abs(magnitude_accel - GRAVIDADE) > LIMIAR){
+    timer_ultimo_movimento = millis(); // Pega o último momento que a criança se mexeu
+    if(!crianca_movimento){
+      crianca_movimento = true;
+      if(deviceConnected){
+        pCharacteristic_BMI160->setValue((uint8_t*)&crianca_movimento, 1); 
+        pCharacteristic_BMI160->notify();
+      }
+    }
   }
-
-  oAdvertisementData.setManufacturerData(strData);
-  
-  pAdvertising->stop();
-  pAdvertising->setAdvertisementData(oAdvertisementData);
-  pAdvertising->start();
 }
 
 void setup() {
@@ -162,17 +126,20 @@ void setup() {
   digitalWrite(BUZZER_PIN, HIGH); 
 
   // Configuração BMI160
-  writeRegister(REG_CMD, CMD_SOFT_RESET);
-  delay(100); 
-  Wire.beginTransmission(BMI160_ADDR);
-  if(Wire.endTransmission() == 0) {
-      Serial.println("BMI160 OK!");
-      accel_funcionando = true;
-      writeRegister(REG_CMD, CMD_ACCEL_NORMAL);
-      delay(100); 
-  } else {
-      Serial.println("ERRO BMI160");
+  if(!BMI160.begin(BMI160GenClass::I2C_MODE, BMI160_ADDR)){
+    //Informar ao app que o acelerômetro não iniciou
+    while(1);
   }
+  else{
+    accel_funcionando = true;
+  }
+
+  // Define o giroscópio como desativado (economia de energia)
+  BMI160.setAccelerometerRange(2);
+  Wire.beginTransmission(BMI160_ADDR);
+  Wire.write(REG_CMD);
+  Wire.write(CMD_GYR_SUSPEND);
+  Wire.endTransmission();
 
   // Configuração BLE
   BLEDevice::init(DEVICE_NAME);
@@ -211,8 +178,8 @@ void setup() {
   BLE2902 *pDescritor_BMI160_subscribe = new BLE2902();
 
   pDescritor_BUZZER->setDescription("Buzzer");
-  pDescritor_TEMP->setDescription("Temperatura");
-  pDescritor_BMI160->setDescription("Acelerômetro");
+  pDescritor_TEMP->setDescription("Indicador da pulseira no braço");
+  pDescritor_BMI160->setDescription("Indicador de movimento");
 
   pCharacteristic_BUZZER->addDescriptor(pDescritor_BUZZER);
   pCharacteristic_TEMP->addDescriptor(pDescritor_TEMP);
@@ -252,25 +219,45 @@ void loop() {
   }
 
 
-  if ((tempo_atual - timer_temp) >= INTERVALO_TEMP) {
+  if ((tempo_atual - timer_temp) > INTERVALO_TEMP) {
     timer_temp = tempo_atual;    
     sensor_temp.requestTemperatures(); 
     float t_lida = sensor_temp.getTempCByIndex(0);    
-    if(t_lida > -100) {
-      if (abs(t_lida - temperatura_atual) >= TEMP_VARIACAO_LIMITE) {
-          temperatura_atual = t_lida;       
-          pCharacteristic_TEMP->setValue((uint8_t*)&temperatura_atual, sizeof(float));
+    if (abs(t_lida - TEMP_ESPERADA) >= TEMP_VARIACAO_LIMITE) { 
+      if(!pulseira_removida){
+        pulseira_removida = true;
+        if(deviceConnected){
+          pCharacteristic_TEMP->setValue((uint8_t*)&pulseira_removida, 1);
           pCharacteristic_TEMP->notify();
+        }
+      }
+    }
+    else if(pulseira_removida){
+      pulseira_removida = false;
+      if(deviceConnected){
+        pCharacteristic_TEMP->setValue((uint8_t*)&pulseira_removida, 1);
+        pCharacteristic_TEMP->notify();
       }
     }
   }
 
-  // --- Leitura Accel e Envio do Broadcast ---
+
+  // --- Verificação se a criança continua em movimento ---
+  if(crianca_movimento){
+    if((tempo_atual - timer_ultimo_movimento) >= COUNTDOWN_MOVIMENTO){
+        crianca_movimento = false;
+        if(deviceConnected){
+          pCharacteristic_BMI160->setValue((uint8_t*)&crianca_movimento, 1);
+          pCharacteristic_BMI160->notify();
+        }
+    }
+  }
+
+  // --- Leitura Accel ---
   if ((tempo_atual - timer_accel) >= INTERVALO_ACCEL) {
     timer_accel = tempo_atual;
     if(accel_funcionando) {
-      readAccelRaw();
+      readAccel();
     }
-    updateBroadcastData();
   }
 }
