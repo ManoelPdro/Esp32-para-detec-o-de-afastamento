@@ -16,9 +16,11 @@
 #define CHARACTERISTIC_TEMP_UUID "bd072c9e-1f6b-4a84-b8aa-7b55ddc0d986"
 #define CHARACTERISTIC_BMI160_UUID "e2770502-84a8-49fd-b716-1f9ade3e4ea9"
 
-#define BUZZER_PIN 18
-#define LED_PIN 2
-#define TEMP_PIN 4
+#define BUZZER_PIN 4
+#define LED_PIN 8
+#define TEMP_PIN 2
+#define SDA_PIN 5
+#define SCL_PIN 6
 
 #define INTERVALO_TEMP 3000 // Lê a temperatura a cada 3 segundos (talvez seja melhor diminuir esse tempo, em 3 segundos a criança já tirou e correu 3 quarteirões e morreu atropelada por 3 motoboys)    
 #define INTERVALO_ACCEL 200    
@@ -73,6 +75,7 @@ class MyServerCallbacks : public BLEServerCallbacks {
     deviceConnected = true;
     portEXIT_CRITICAL(&mux);
     digitalWrite(LED_PIN, HIGH); // Pode remover essa linha para economizar bateria ou caso o professor remova o processador do esp da placa, remova também o define do LED_PIN
+    vTaskResume(TaskSensoresHandle);
   }
 
   void onDisconnect(BLEServer *pServer) {
@@ -80,6 +83,7 @@ class MyServerCallbacks : public BLEServerCallbacks {
     deviceConnected = false;
     portEXIT_CRITICAL(&mux);
     digitalWrite(LED_PIN, LOW); // Pode remover essa linha também pelo mesmo motivo da anotação anterior
+    vTaskSuspend(TaskSensoresHandle);
     pAdvertising->start(); 
   }
 };
@@ -306,7 +310,7 @@ void TaskBLE(void *pvParameters){
 
 void setup() {
   Serial.begin(9600);
-  Wire.begin();  
+  Wire.begin(SDA_PIN, SCL_PIN);  
   
   sensor_temp.begin();
   sensor_temp.setWaitForConversion(false); 
@@ -333,24 +337,22 @@ void setup() {
   }
 
   // Criação das threads de sensores e BLE 
-  xTaskCreatePinnedToCore(
+  xTaskCreate(
     TaskSensores,    // Função da task
     "TaskSensores",  // Nome da task
     8192,          // Tamanho da pilha (stack)
     NULL,            // Parâmetros passados (no caso, nenhum)
     1,               // Prioridade (baixa)
-    &TaskSensoresHandle,
-    1                // Rodar no Core 1 (Core padrão do Arduino)     
+    &TaskSensoresHandle
   );
 
-  xTaskCreatePinnedToCore(
+  xTaskCreate(
     TaskBLE,
     "TaskBLE",
     6144,
     NULL,
     1,
-    &TaskBLEHandle,
-    0                // Rodar no Core 0 (Core do rádio wifi/ble) 
+    &TaskBLEHandle
   );
 }
 
