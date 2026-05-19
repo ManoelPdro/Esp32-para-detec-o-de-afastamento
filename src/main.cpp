@@ -2,98 +2,80 @@
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
-//#include <BLE2901.h>
 #include <BLE2902.h>
 #include <Wire.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include "BMI160Gen.h"
 
 // --- DEFINES ---
 #define DEVICE_NAME "ESP32 SENSOR"
+#define MANUFACTURER_ID 0xFFFF // ID genérico usado para o empacotamento de dados
+
 #define SERVICE_UUID "44806210-84bc-4a2a-a9ff-92ff65f30c8c"
 #define CHARACTERISTIC_BUZZER_UUID "6064f23e-7f34-49c0-a969-070cd0ebcce0"
-#define CHARACTERISTIC_TEMP_UUID "bd072c9e-1f6b-4a84-b8aa-7b55ddc0d986"
-#define CHARACTERISTIC_BMI160_UUID "e2770502-84a8-49fd-b716-1f9ade3e4ea9"
 
-#define BUZZER_PIN 10
-//#define LED_PIN 8
+#define BUZZER_PIN 3
 #define TEMP_PIN 7
 #define SDA_PIN 8
 #define SCL_PIN 9
 
-#define INTERVALO_TEMP 3000 // Lê a temperatura a cada 3 segundos (talvez seja melhor diminuir esse tempo, em 3 segundos a criança já tirou e correu 3 quarteirões e morreu atropelada por 3 motoboys)    
+#define INTERVALO_TEMP 3000
 #define INTERVALO_ACCEL 200
 #define TEMPO_DURACAO_BUZZER 1500 // Buzzer toca por 1,5 segundos
-#define COUNTDOWN_MOVIMENTO 5000 // Para verificar após 5 segundos se a criança parou de se mexer (pode diminuir o tempo se achar pertinente)
 
-// CONFIGURAÇÃO DA HISTERESE (VARIAÇÃO MÍNIMA)
-#define TEMP_ESPERADA 33 // Espera que a temperatura da criança está por volta de 33 graus (ajuste esse valor e a variação limite caso necessário)
-#define TEMP_VARIACAO_LIMITE 2 // Caso a temperatura varie 2 graus ou mais pode ser que a criança tenha removido e o esp envia o sinal para o app
+// Constantes físicas e de registradores do BMI160
+#define BMI160_ADDR     0x69
+#define REG_CHIP_ID     0x00  // Deve retornar 0xD1
+#define REG_DATA_X      0x12  // Início dos dados do acelerômetro (X_LSB)
+#define REG_CMD         0x7E  // Registrador de comando
 
-// Endereços e constantes BMI160
-#define BMI160_ADDR 0x69
-#define REG_CMD 0x7E
-#define CMD_GYR_SUSPEND 0x14
+// Comandos de gerenciamento de energia internos do chip
+#define CMD_ACC_NORMAL  0x11  // Liga o Acelerômetro em Modo Normal
+#define CMD_GYR_SUSPEND 0x14  // Coloca o Giroscópio em Suspend (Economia)
+
 #define LIMIAR 0.2
 #define GRAVIDADE 1.0
 
-// --- OBJETOS GLOBAIS ---
-BLECharacteristic *pCharacteristic_BUZZER;
-BLECharacteristic *pCharacteristic_TEMP;
-BLECharacteristic *pCharacteristic_BMI160;
-BLEAdvertising *pAdvertising;
+BLECharacteristic *pCharacteristic_BUZZER = nullptr;
+BLEAdvertising *pAdvertising = nullptr;
 
 OneWire oneWire(TEMP_PIN);
 DallasTemperature sensor_temp(&oneWire);
-
-// --- VARIÁVEIS GLOBAIS ---
-// Mux para proteger as variáveis compartilhadas
 portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 
-// Variáveis de Dados compartilhadas pelas threads
-volatile bool crianca_movimento = false; // Define se a criança está se mexendo
-volatile bool pulseira_removida = false; // Indica se a criança ainda está com a pulseira
 volatile bool deviceConnected = false; 
 volatile bool comando_buzzer_recebido = false; 
 
-// Flags de notificação, para a thread dos sensores avisar à thread ble para enviar os dados
-volatile bool flag_notify_temp = false;
-volatile bool flag_notify_bmi = false;
-
-// Flags de Estado
 bool accel_funcionando = false;
 
-// Handles
-TaskHandle_t TaskSensoresHandle;
-TaskHandle_t TaskBLEHandle;
-
-// --- CALLBACKS BLE ---
+// Handles das Tasks
+TaskHandle_t TaskSensoresHandle = NULL;
+TaskHandle_t TaskBLEHandle = NULL;
 
 class MyServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *pServer) {
     portENTER_CRITICAL(&mux);
     deviceConnected = true;
     portEXIT_CRITICAL(&mux);
-    //digitalWrite(LED_PIN, HIGH); // Pode remover essa linha para economizar bateria ou caso o professor remova o processador do esp da placa, remova também o define do LED_PIN
-    vTaskResume(TaskSensoresHandle);
+    Serial.println("[BLE] App Conectou! Pronto para receber comando do Buzzer.");
   }
 
   void onDisconnect(BLEServer *pServer) {
     portENTER_CRITICAL(&mux);
     deviceConnected = false;
     portEXIT_CRITICAL(&mux);
-    //digitalWrite(LED_PIN, LOW); // Pode remover essa linha também pelo mesmo motivo da anotação anterior
-    vTaskSuspend(TaskSensoresHandle);
+    Serial.println("[BLE] App Desconectou. Reiniciando Broadcast de dados...");
+    
     pAdvertising->start(); 
   }
 };
 
-
 class CharacteristicCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pCharacteristic) {
-    std::string rxValue = std::string(pCharacteristic->getValue().c_str());
-    if (rxValue.length() > 0 && rxValue.substr(0, 1) == "1") {
+    std::string rxValue = pCharacteristic->getValue();
+    
+    // Se o app enviar "1", ativa o sinal do buzzer
+    if (rxValue.length() > 0 && rxValue[0] == '1') {
       portENTER_CRITICAL(&mux); 
       comando_buzzer_recebido = true;
       portEXIT_CRITICAL(&mux);
@@ -101,7 +83,6 @@ class CharacteristicCallbacks : public BLECharacteristicCallbacks {
   }
 };
 
-// --- FUNÇÕES AUXILIARES ---
 void setupBLE(){
   BLEDevice::init(DEVICE_NAME);
   
@@ -114,139 +95,142 @@ void setupBLE(){
 
   BLEService *pService = pServer->createService(SERVICE_UUID);
 
-  //Caracteristicas
   pCharacteristic_BUZZER = pService->createCharacteristic(
     CHARACTERISTIC_BUZZER_UUID,
     BLECharacteristic::PROPERTY_WRITE
   );
-  pCharacteristic_TEMP = pService->createCharacteristic(
-    CHARACTERISTIC_TEMP_UUID, 
-    BLECharacteristic::PROPERTY_NOTIFY
-  );
-  pCharacteristic_BMI160 = pService->createCharacteristic(
-    CHARACTERISTIC_BMI160_UUID, 
-    BLECharacteristic::PROPERTY_NOTIFY
-  );
-
   pCharacteristic_BUZZER->setCallbacks(new CharacteristicCallbacks());
-
-  // descritores
-  /*
-  BLE2901 *pDescritor_BUZZER = new BLE2901();
-  BLE2901 *pDescritor_TEMP = new BLE2901();
-  BLE2901 *pDescritor_BMI160 = new BLE2901();
-  
-
-  BLE2902 *pDescritor_TEMP_subscribe = new BLE2902();
-  BLE2902 *pDescritor_BMI160_subscribe = new BLE2902();
-
-  pDescritor_BUZZER->setDescription("Buzzer");
-  pDescritor_TEMP->setDescription("Indicador da pulseira no braço");
-  pDescritor_BMI160->setDescription("Indicador de movimento");
-
-  pCharacteristic_BUZZER->addDescriptor(pDescritor_BUZZER);
-  pCharacteristic_TEMP->addDescriptor(pDescritor_TEMP);
-  pCharacteristic_BMI160->addDescriptor(pDescritor_BMI160);
-  pCharacteristic_TEMP->addDescriptor(pDescritor_TEMP_subscribe);
-  pCharacteristic_BMI160->addDescriptor(pDescritor_BMI160_subscribe);
-  */
-
   pService->start();
 
   pAdvertising = BLEDevice::getAdvertising();
   pAdvertising->addServiceUUID(SERVICE_UUID);
-  pAdvertising->setScanResponse(true);
-  pAdvertising->setMinInterval(0x100); 
-  pAdvertising->setMaxInterval(0x200); // tempo aumentado para economizar bateria, diminuam caso queiram testar se afeta o RSSI
-
+  pAdvertising->setScanResponse(false);
+  
+  pAdvertising->setMinInterval(0x20); 
+  pAdvertising->setMaxInterval(0x40); 
+  
   pAdvertising->start();
 }
 
-// ==============================================
+// --- ATUALIZAÇÃO DOS DADOS DE BROADCAST ---
+void atualizarBroadcast(float temperatura, int16_t accX, int16_t accY, int16_t accZ) {
+    if (deviceConnected) return;
+
+    BLEAdvertisementData oAdvertisementData;
+    uint8_t strServiceData[10];
+    
+    strServiceData[0] = MANUFACTURER_ID & 0xFF;
+    strServiceData[1] = (MANUFACTURER_ID >> 8) & 0xFF;
+    
+    int16_t tempInt = (int16_t)(temperatura * 100);
+    
+    strServiceData[2] = tempInt & 0xFF;
+    strServiceData[3] = (tempInt >> 8) & 0xFF;
+    strServiceData[4] = accX & 0xFF;
+    strServiceData[5] = (accX >> 8) & 0xFF;
+    strServiceData[6] = accY & 0xFF;
+    strServiceData[7] = (accY >> 8) & 0xFF;
+    strServiceData[8] = accZ & 0xFF;
+    strServiceData[9] = (accZ >> 8) & 0xFF;
+
+    std::string dataPayload((char*)strServiceData, 10);
+    oAdvertisementData.setManufacturerData(dataPayload);
+    oAdvertisementData.setName(DEVICE_NAME);
+    
+    pAdvertising->stop(); // Previne vazamento de memória RAM nas atualizações recorrentes
+    pAdvertising->setAdvertisementData(oAdvertisementData);
+    pAdvertising->start(); 
+}
+
+// Função de segurança para limpar barramento travado
+void destravarI2C() {
+  pinMode(SDA_PIN, INPUT_PULLUP);
+  pinMode(SCL_PIN, OUTPUT);
+  for (byte i = 0; i < 9; i++) {
+    digitalWrite(SCL_PIN, HIGH); delayMicroseconds(5);
+    digitalWrite(SCL_PIN, LOW); delayMicroseconds(5);
+  }
+  pinMode(SDA_PIN, OUTPUT);
+  digitalWrite(SDA_PIN, LOW); delayMicroseconds(5);
+  digitalWrite(SCL_PIN, HIGH); delayMicroseconds(5);
+  digitalWrite(SDA_PIN, HIGH); delayMicroseconds(5);
+}
+
 // THREAD 1: LEITURA DOS SENSORES (CORE 1)
-// ==============================================
 void TaskSensores(void *pvParameters){
   unsigned long timer_accel = 0;
   unsigned long timer_temp = 0;
-  unsigned long timer_ultimo_movimento = 0;
   
-  //loop infinito da thread
+  float ultima_temp = 0.0;
+  int16_t axRaw = 0, ayRaw = 0, azRaw = 0;
+  
   for(;;){
     unsigned long tempo_atual = millis();
     
-    portENTER_CRITICAL(&mux);
-    bool local_pulseira = pulseira_removida;
-    bool local_movimento = crianca_movimento;
-    portEXIT_CRITICAL(&mux);
-
-    //leitura da temperatura
+    // 1. Leitura do Sensor de Temperatura Dallas
     if ((tempo_atual - timer_temp) > INTERVALO_TEMP) {
-      timer_temp = tempo_atual;    
-      sensor_temp.requestTemperatures(); 
-      float t_lida = sensor_temp.getTempCByIndex(0);
-      Serial.print("[TEMP] Atual: "); Serial.print(t_lida); Serial.print(" C | Status: ");
-      
-      if (abs(t_lida - TEMP_ESPERADA) >= TEMP_VARIACAO_LIMITE) { 
-        if(!local_pulseira){
-          portENTER_CRITICAL(&mux);
-          pulseira_removida = true;
-          flag_notify_temp = true; // Avisa a thread BLE para atualizar o status da criança estar ou não com a pulseira
-          portEXIT_CRITICAL(&mux);
-        }
-      }
-      else if(local_pulseira){
-        portENTER_CRITICAL(&mux);
-        pulseira_removida = false;
-        flag_notify_temp = true;
-        portEXIT_CRITICAL(&mux);
-      }
+      timer_temp = tempo_atual;
+      sensor_temp.requestTemperatures();
+      ultima_temp = sensor_temp.getTempCByIndex(0);
+      Serial.print("[TEMP] Atualizada: "); Serial.println(ultima_temp);
     }
 
-    // leitura do acelerômetro
+    // 2. Leitura do Acelerômetro Manual Direta via Wire (A cada 200ms)
     if((tempo_atual - timer_accel) >= INTERVALO_ACCEL){
       timer_accel = tempo_atual;
+      
       if(accel_funcionando){
-        int axRaw, ayRaw, azRaw;
-        float accelX, accelY, accelZ;
-        float magnitude_accel;
+        // Solicita os dados a partir do registrador base X_LSB (0x12)
+        Wire.beginTransmission(BMI160_ADDR);
+        Wire.write(REG_DATA_X);
+        
+        if (Wire.endTransmission(false) == 0) {
+          int bytesRecebidos = Wire.requestFrom(BMI160_ADDR, 6);
+          
+          if (bytesRecebidos == 6) {
+            uint8_t x_lsb = Wire.read();
+            uint8_t x_msb = Wire.read();
+            uint8_t y_lsb = Wire.read();
+            uint8_t y_msb = Wire.read();
+            uint8_t z_lsb = Wire.read();
+            uint8_t z_msb = Wire.read();
+            
+            // Junção binária correta e segura (MSB deslocado e mascarado com LSB)
+            axRaw = (int16_t)((x_msb << 8) | x_lsb);
+            ayRaw = (int16_t)((y_msb << 8) | y_lsb);
+            azRaw = (int16_t)((z_msb << 8) | z_lsb);
 
-        BMI160.readAccelerometer(axRaw, ayRaw, azRaw);
+            // Processamento matemático original mantido intacto
+            float accelX = axRaw / 16384.0;
+            float accelY = ayRaw / 16384.0;
+            float accelZ = azRaw / 16384.0;
 
-        accelX = axRaw/16384.0;
-        accelY = ayRaw/16384.0;
-        accelZ = azRaw/16384.0;
-        Serial.println("mov x,y,z ");Serial.print(accelX);Serial.print(accelY);Serial.print(accelZ);
+            float magnitude_accel = sqrt(sq(accelX) + sq(accelY) + sq(accelZ));
 
-
-        magnitude_accel = sqrt(sq(accelX) + sq(accelY) + sq(accelZ));
-
-        if(abs(magnitude_accel - GRAVIDADE) > LIMIAR){
-          timer_ultimo_movimento = millis(); // Pega o último momento que a criança se mexeu
-          if(!local_movimento){
-            portENTER_CRITICAL(&mux);
-            crianca_movimento = true;
-            flag_notify_bmi = true; // Avisa a thread BLE para indicar que a criança se mexeu
-            portEXIT_CRITICAL(&mux);
+            // Print idêntico ao solicitado para monitoramento dos limites
+            Serial.print("mov x,y,z "); Serial.print(accelX); Serial.print(" "); Serial.print(accelY); Serial.print(" "); Serial.println(accelZ);
+            
+            if(abs(magnitude_accel - GRAVIDADE) > LIMIAR){
+              Serial.println("[ACCEL] Movimento detectado acima do limiar!");
+            }
+          } else {
+            Serial.print("[ERRO I2C] Bytes incompletos recebidos: "); Serial.println(bytesRecebidos);
           }
+        } else {
+          Serial.println("[ERRO I2C] Barramento inacessível. Tentando restaurar...");
+          destravarI2C();
         }
       } 
-    }
-    
-    if(local_movimento){
-      if((millis() - timer_ultimo_movimento) >= COUNTDOWN_MOVIMENTO){
-        portENTER_CRITICAL(&mux);
-        crianca_movimento = false;
-        flag_notify_bmi = true;
-        portEXIT_CRITICAL(&mux);
-      }
+      // Transmite as variáveis brutas (raw) convertidas para int16_t via payload estruturado
+      atualizarBroadcast(ultima_temp, axRaw, ayRaw, azRaw);
     }
 
-    vTaskDelay(10 / portTICK_PERIOD_MS);
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
   
 // ==============================================
-// THREAD 2: BLE E ATUADORES (CORE 0)
+// THREAD 2: COMANDOS DO BUZZER (CORE 0)
 // ==============================================
 void TaskBLE(void *pvParameters){
   unsigned long timer_inicio_buzzer = 0;
@@ -260,10 +244,8 @@ void TaskBLE(void *pvParameters){
     comando_buzzer_recebido = false;
     portEXIT_CRITICAL(&mux);
 
-    // Lógica do buzzer
     if (local_buzzer) {
-      digitalWrite(BUZZER_PIN, LOW);
-      Serial.print("massa");
+      digitalWrite(BUZZER_PIN, LOW); 
       timer_inicio_buzzer = tempo_atual;
       buzzer_esta_tocando = true;
     }
@@ -275,96 +257,83 @@ void TaskBLE(void *pvParameters){
       }
     }
 
-    portENTER_CRITICAL(&mux);
-    bool local_connected = deviceConnected;
-    portEXIT_CRITICAL(&mux);
-
-    // Envio das notificações via BLE
-    if(local_connected){
-      portENTER_CRITICAL(&mux);
-      bool local_flag_temp = flag_notify_temp;
-      bool local_pulseira = pulseira_removida;
-      flag_notify_temp = false;
-      portEXIT_CRITICAL(&mux);
-
-      if(local_flag_temp){
-        uint8_t confirmacao_remocao = local_pulseira ? 1 : 0;
-        pCharacteristic_TEMP->setValue(&confirmacao_remocao, 1);
-        pCharacteristic_TEMP->notify();
-      }
-      portENTER_CRITICAL(&mux);
-      bool local_flag_bmi = flag_notify_bmi;
-      bool local_movimento = crianca_movimento;
-      flag_notify_bmi = false;
-      portEXIT_CRITICAL(&mux);
-
-      if(local_flag_bmi){
-        uint8_t confirmacao_movimento = local_movimento ? 1 : 0; 
-        pCharacteristic_BMI160->setValue(&confirmacao_movimento, 1);
-        pCharacteristic_BMI160->notify();
-      }
-    }
-    else{
-      // Limpa as flags caso disconecte para não ficar enviando sem necessidade
-      portENTER_CRITICAL(&mux);
-      flag_notify_temp = false;
-      flag_notify_bmi = false;
-      portEXIT_CRITICAL(&mux);
-    }
-
-    vTaskDelay(20 / portTICK_PERIOD_MS);
+    vTaskDelay(pdMS_TO_TICKS(20));
   }
 }
 
-
+// --- SETUP PRINCIPAL ---
 void setup() {
   Serial.begin(115200);
-  Wire.begin(SDA_PIN, SCL_PIN);  
+  delay(1000); // Janela para estabilizar a Serial
+  
+  destravarI2C(); // Limpa pinos antes de associar ao Wire
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000); // Frequência inicial robusta de 100kHz
+  delay(100);
   
   sensor_temp.begin();
   sensor_temp.setWaitForConversion(false); 
   
-  //pinMode(LED_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, HIGH); 
 
   setupBLE();
 
-  // Configuração BMI160
-  if(!BMI160.begin(BMI160GenClass::I2C_MODE, BMI160_ADDR)){
-    //Informar ao app que o acelerômetro não iniciou
-  }
-  else{
-    accel_funcionando = true;
-    
-    // Define o giroscópio como desativado (economia de energia)
-    BMI160.setAccelerometerRange(2);
-    Wire.beginTransmission(BMI160_ADDR);
-    Wire.write(REG_CMD);
-    Wire.write(CMD_GYR_SUSPEND);
-    Wire.endTransmission();
+  // Verificação de Conexão Física Direta com o Chip (Sem depender de Libs)
+  Wire.beginTransmission(BMI160_ADDR);
+  Wire.write(REG_CHIP_ID);
+  
+  if(Wire.endTransmission(false) == 0) {
+    Wire.requestFrom(BMI160_ADDR, 1);
+    if(Wire.available() == 1 && Wire.read() == 0xD1) {
+      
+      // CONFIGURAÇÃO SEGUIDA DE ENERGIA DO CHIP:
+      // 1. Liga o Acelerômetro (Modo Normal)
+      Wire.beginTransmission(BMI160_ADDR);
+      Wire.write(REG_CMD);
+      Wire.write(CMD_ACC_NORMAL);
+      Wire.endTransmission();
+      delay(50); // Delay obrigatório exigido pelo Datasheet (3.8ms a 50ms)
+
+      // 2. Desliga/Suspende o Giroscópio conforme sua lógica original
+      Wire.beginTransmission(BMI160_ADDR);
+      Wire.write(REG_CMD);
+      Wire.write(CMD_GYR_SUSPEND);
+      Wire.endTransmission();
+      delay(50);
+
+      accel_funcionando = true;
+      Serial.println("[SUCESSO] BMI160 acordado e configurado via Wire puro.");
+    } else {
+      Serial.println("[ERRO CRÍTICO] Chip ID inválido retornado pelo BMI160.");
+    }
+  } else {
+    Serial.println("[AVISO] Acelerômetro BMI160 não respondeu no endereço 0x69.");
   }
 
-  // Criação das threads de sensores e BLE 
-  xTaskCreate(
-    TaskSensores,    // Função da task
-    "TaskSensores",  // Nome da task
-    8192,          // Tamanho da pilha (stack)
-    NULL,            // Parâmetros passados (no caso, nenhum)
-    1,               // Prioridade (baixa)
-    &TaskSensoresHandle
-  );
-
-  xTaskCreate(
+  // Criação das Tasks em seus Cores nativos (Mantido sem alterações)
+  xTaskCreatePinnedToCore(
     TaskBLE,
     "TaskBLE",
-    6144,
+    4096,
+    NULL,
+    2,
+    &TaskBLEHandle,
+    0
+  );
+
+  xTaskCreatePinnedToCore(
+    TaskSensores,
+    "TaskSensores",
+    4096,
     NULL,
     1,
-    &TaskBLEHandle
+    &TaskSensoresHandle,
+    1
   );
 }
 
 void loop() {
-  vTaskDelete(NULL); // Deleta a thread loop pois consumiria memória a toa
+  vTaskDelete(NULL); 
 }

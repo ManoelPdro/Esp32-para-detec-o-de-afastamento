@@ -194,7 +194,4 @@
  C:/Users/USER/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp32-hal.h \
  .pio/libdeps/esp32-c3-mini/OneWire/OneWire.h \
  .pio/libdeps/esp32-c3-mini/OneWire/util/OneWire_direct_regtype.h \
- .pio/libdeps/esp32-c3-mini/DallasTemperature/DallasTemperature.h \
- .pio/libdeps/esp32-c3-mini/EmotiBit\ BMI160/BMI160Gen.h \
- .pio/libdeps/esp32-c3-mini/EmotiBit\ BMI160/CurieIMU.h \
- .pio/libdeps/esp32-c3-mini/EmotiBit\ BMI160/BMI160.h
+ .pio/libdeps/esp32-c3-mini/DallasTemperature/DallasTemperature.h
