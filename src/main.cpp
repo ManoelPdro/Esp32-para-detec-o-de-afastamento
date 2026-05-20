@@ -112,8 +112,7 @@ void setupBLE(){
   pAdvertising->start();
 }
 
-// --- ATUALIZAÇÃO DOS DADOS DE BROADCAST ---
-void atualizarBroadcast(float temperatura, int16_t accX, int16_t accY, int16_t accZ) {
+void atualizarBroadcast(float temperatura, float axRaw, float ayRaw, float azRaw) {
     if (deviceConnected) return;
 
     BLEAdvertisementData oAdvertisementData;
@@ -121,27 +120,34 @@ void atualizarBroadcast(float temperatura, int16_t accX, int16_t accY, int16_t a
     
     strServiceData[0] = MANUFACTURER_ID & 0xFF;
     strServiceData[1] = (MANUFACTURER_ID >> 8) & 0xFF;
-    
+
+
     int16_t tempInt = (int16_t)(temperatura * 100);
-    
     strServiceData[2] = tempInt & 0xFF;
     strServiceData[3] = (tempInt >> 8) & 0xFF;
-    strServiceData[4] = accX & 0xFF;
-    strServiceData[5] = (accX >> 8) & 0xFF;
-    strServiceData[6] = accY & 0xFF;
-    strServiceData[7] = (accY >> 8) & 0xFF;
-    strServiceData[8] = accZ & 0xFF;
-    strServiceData[9] = (accZ >> 8) & 0xFF;
+    float accelX = axRaw / 16384.0;
+    float accelY = ayRaw / 16384.0;
+    float accelZ = azRaw / 16384.0;
+
+    int16_t xInt = (int16_t)(accelX * 1000.0);
+    int16_t yInt = (int16_t)(accelY * 1000.0);
+    int16_t zInt = (int16_t)(accelZ * 1000.0);
+    
+    strServiceData[4] = xInt & 0xFF;
+    strServiceData[5] = (xInt >> 8) & 0xFF;
+    strServiceData[6] = yInt & 0xFF;
+    strServiceData[7] = (yInt >> 8) & 0xFF;
+    strServiceData[8] = zInt & 0xFF;
+    strServiceData[9] = (zInt >> 8) & 0xFF;
 
     std::string dataPayload((char*)strServiceData, 10);
     oAdvertisementData.setManufacturerData(dataPayload);
     oAdvertisementData.setName(DEVICE_NAME);
     
-    pAdvertising->stop(); // Previne vazamento de memória RAM nas atualizações recorrentes
+    pAdvertising->stop(); // Previne vazamento de memória RAM
     pAdvertising->setAdvertisementData(oAdvertisementData);
     pAdvertising->start(); 
 }
-
 // Função de segurança para limpar barramento travado
 void destravarI2C() {
   pinMode(SDA_PIN, INPUT_PULLUP);
